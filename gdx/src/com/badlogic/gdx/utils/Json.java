@@ -16,16 +16,6 @@
 
 package com.badlogic.gdx.utils;
 
-import com.badlogic.gdx.files.FileHandle;
-import com.badlogic.gdx.utils.JsonWriter.OutputType;
-import com.badlogic.gdx.utils.ObjectMap.Entry;
-import com.badlogic.gdx.utils.ObjectMap.Values;
-import com.badlogic.gdx.utils.reflect.ArrayReflection;
-import com.badlogic.gdx.utils.reflect.ClassReflection;
-import com.badlogic.gdx.utils.reflect.Constructor;
-import com.badlogic.gdx.utils.reflect.Field;
-import com.badlogic.gdx.utils.reflect.ReflectionException;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.Reader;
@@ -33,28 +23,43 @@ import java.io.StringWriter;
 import java.io.Writer;
 import java.security.AccessControlException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
+import com.badlogic.gdx.files.FileHandle;
+import com.badlogic.gdx.utils.JsonValue.PrettyPrintSettings;
+import com.badlogic.gdx.utils.JsonWriter.OutputType;
+import com.badlogic.gdx.utils.ObjectMap.Entry;
+import com.badlogic.gdx.utils.OrderedMap.OrderedMapValues;
+import com.badlogic.gdx.utils.reflect.ArrayReflection;
+import com.badlogic.gdx.utils.reflect.ClassReflection;
+import com.badlogic.gdx.utils.reflect.Constructor;
+import com.badlogic.gdx.utils.reflect.Field;
+import com.badlogic.gdx.utils.reflect.ReflectionException;
+
 /** Reads/writes Java objects to/from JSON, automatically. See the wiki for usage:
- * https://code.google.com/p/libgdx/wiki/JsonParsing
+ * https://github.com/libgdx/libgdx/wiki/Reading-%26-writing-JSON
  * @author Nathan Sweet */
 public class Json {
-	private static final boolean debug = false;
+	static private final boolean debug = false;
 
 	private JsonWriter writer;
 	private String typeName = "class";
 	private boolean usePrototypes = true;
 	private OutputType outputType;
-	private final ObjectMap<Class, ObjectMap<String, FieldMetadata>> typeToFields = new ObjectMap();
+	private boolean quoteLongValues;
+	private boolean ignoreUnknownFields;
+	private boolean enumNames = true;
+	private Serializer defaultSerializer;
+	private final ObjectMap<Class, OrderedMap<String, FieldMetadata>> typeToFields = new ObjectMap();
 	private final ObjectMap<String, Class> tagToClass = new ObjectMap();
 	private final ObjectMap<Class, String> classToTag = new ObjectMap();
 	private final ObjectMap<Class, Serializer> classToSerializer = new ObjectMap();
 	private final ObjectMap<Class, Object[]> classToDefaultValues = new ObjectMap();
-	private boolean ignoreUnknownFields;
+	private final Object[] equals1 = {null}, equals2 = {null};
 
 	public Json () {
 		outputType = OutputType.minimal;
@@ -64,41 +69,59 @@ public class Json {
 		this.outputType = outputType;
 	}
 
+	/** When true, fields in the JSON that are not found on the class will not throw a {@link SerializationException}. Default is
+	 * false. */
 	public void setIgnoreUnknownFields (boolean ignoreUnknownFields) {
 		this.ignoreUnknownFields = ignoreUnknownFields;
 	}
 
+	/** @see JsonWriter#setOutputType(OutputType) */
 	public void setOutputType (OutputType outputType) {
 		this.outputType = outputType;
 	}
 
+	/** @see JsonWriter#setQuoteLongValues(boolean) */
+	public void setQuoteLongValues (boolean quoteLongValues) {
+		this.quoteLongValues = quoteLongValues;
+	}
+
+	/** When true, {@link Enum#name()} is used to write enum values. When false, {@link Enum#toString()} is used which may not be
+	 * unique. Default is true. */
+	public void setEnumNames (boolean enumNames) {
+		this.enumNames = enumNames;
+	}
+
+	/** Sets a tag to use instead of the fully qualifier class name. This can make the JSON easier to read. */
 	public void addClassTag (String tag, Class type) {
 		tagToClass.put(tag, type);
 		classToTag.put(type, tag);
 	}
 
+	/** Returns the class for the specified tag, or null. */
 	public Class getClass (String tag) {
-		Class type = tagToClass.get(tag);
-		if (type != null) return type;
-		try {
-			return ClassReflection.forName(tag);
-		} catch (ReflectionException ex) {
-			throw new SerializationException(ex);
-		}
+		return tagToClass.get(tag);
 	}
 
+	/** Returns the tag for the specified class, or null. */
 	public String getTag (Class type) {
-		String tag = classToTag.get(type);
-		if (tag != null) return tag;
-		return type.getName();
+		return classToTag.get(type);
 	}
 
 	/** Sets the name of the JSON field to store the Java class name or class tag when required to avoid ambiguity during
-	 * deserialization. Set to null to never output this information, but be warned that deserialization may fail. */
+	 * deserialization. Set to null to never output this information, but be warned that deserialization may fail. Default is
+	 * "class". */
 	public void setTypeName (String typeName) {
 		this.typeName = typeName;
 	}
 
+	/** Sets the serializer to use when the type being deserialized is not known (null).
+	 * @param defaultSerializer May be null. */
+	public void setDefaultSerializer (Serializer defaultSerializer) {
+		this.defaultSerializer = defaultSerializer;
+	}
+
+	/** Registers a serializer to use for the specified type instead of the default behavior of serializing all of an objects
+	 * fields. */
 	public <T> void setSerializer (Class<T> type, Serializer<T> serializer) {
 		classToSerializer.put(type, serializer);
 	}
@@ -107,27 +130,35 @@ public class Json {
 		return classToSerializer.get(type);
 	}
 
+	/** When true, field values that are identical to a newly constructed instance are not written. Default is true. */
 	public void setUsePrototypes (boolean usePrototypes) {
 		this.usePrototypes = usePrototypes;
 	}
 
+	/** Sets the type of elements in a collection. When the element type is known, the class for each element in the collection does
+	 * not need to be written unless different from the element type. */
 	public void setElementType (Class type, String fieldName, Class elementType) {
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
+		ObjectMap<String, FieldMetadata> fields = getFields(type);
 		FieldMetadata metadata = fields.get(fieldName);
 		if (metadata == null) throw new SerializationException("Field not found: " + fieldName + " (" + type.getName() + ")");
 		metadata.elementType = elementType;
 	}
 
-	private ObjectMap<String, FieldMetadata> cacheFields (Class type) {
-		ArrayList<Field> allFields = new ArrayList();
+	private OrderedMap<String, FieldMetadata> getFields (Class type) {
+		OrderedMap<String, FieldMetadata> fields = typeToFields.get(type);
+		if (fields != null) return fields;
+
+		Array<Class> classHierarchy = new Array();
 		Class nextClass = type;
 		while (nextClass != Object.class) {
-			Collections.addAll(allFields, ClassReflection.getDeclaredFields(nextClass));
+			classHierarchy.add(nextClass);
 			nextClass = nextClass.getSuperclass();
 		}
+		ArrayList<Field> allFields = new ArrayList();
+		for (int i = classHierarchy.size - 1; i >= 0; i--)
+			Collections.addAll(allFields, ClassReflection.getDeclaredFields(classHierarchy.get(i)));
 
-		ObjectMap<String, FieldMetadata> nameToField = new ObjectMap();
+		OrderedMap<String, FieldMetadata> nameToField = new OrderedMap();
 		for (int i = 0, n = allFields.size(); i < n; i++) {
 			Field field = allFields.get(i);
 
@@ -179,15 +210,12 @@ public class Json {
 	public void toJson (Object object, Class knownType, Class elementType, FileHandle file) {
 		Writer writer = null;
 		try {
-			writer = file.writer(false);
+			writer = file.writer(false, "UTF-8");
 			toJson(object, knownType, elementType, writer);
 		} catch (Exception ex) {
 			throw new SerializationException("Error writing file: " + file, ex);
 		} finally {
-			try {
-				if (writer != null) writer.close();
-			} catch (IOException ignored) {
-			}
+			StreamUtils.closeQuietly(writer);
 		}
 	}
 
@@ -207,41 +235,46 @@ public class Json {
 		try {
 			writeValue(object, knownType, elementType);
 		} finally {
-			try {
-				this.writer.close();
-			} catch (Exception ignored) {
-			}
+			StreamUtils.closeQuietly(this.writer);
 			this.writer = null;
 		}
 	}
 
-	/** Sets the writer where JSON output will go. This is only necessary when not using the toJson methods. */
+	/** Sets the writer where JSON output will be written. This is only necessary when not using the toJson methods. */
 	public void setWriter (Writer writer) {
 		if (!(writer instanceof JsonWriter)) writer = new JsonWriter(writer);
 		this.writer = (JsonWriter)writer;
 		this.writer.setOutputType(outputType);
+		this.writer.setQuoteLongValues(quoteLongValues);
 	}
 
 	public JsonWriter getWriter () {
 		return writer;
 	}
 
+	/** Writes all fields of the specified object to the current JSON object. */
 	public void writeFields (Object object) {
 		Class type = object.getClass();
 
 		Object[] defaultValues = getDefaultValues(type);
 
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
+		OrderedMap<String, FieldMetadata> fields = getFields(type);
 		int i = 0;
-		for (FieldMetadata metadata : new Values<FieldMetadata>(fields)) {
+		for (FieldMetadata metadata : new OrderedMapValues<FieldMetadata>(fields)) {
 			Field field = metadata.field;
 			try {
 				Object value = field.get(object);
 				if (defaultValues != null) {
 					Object defaultValue = defaultValues[i++];
 					if (value == null && defaultValue == null) continue;
-					if (value != null && defaultValue != null && value.equals(defaultValue)) continue;
+					if (value != null && defaultValue != null) {
+						if (value.equals(defaultValue)) continue;
+						if (value.getClass().isArray() && defaultValue.getClass().isArray()) {
+							equals1[0] = value;
+							equals2[0] = defaultValue;
+							if (Arrays.deepEquals(equals1, equals2)) continue;
+						}
+					}
 				}
 
 				if (debug) System.out.println("Writing field: " + field.getName() + " (" + type.getName() + ")");
@@ -271,9 +304,7 @@ public class Json {
 			return null;
 		}
 
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
-
+		ObjectMap<String, FieldMetadata> fields = getFields(type);
 		Object[] values = new Object[fields.size];
 		classToDefaultValues.put(type, values);
 
@@ -296,24 +327,27 @@ public class Json {
 		return values;
 	}
 
+	/** @see #writeField(Object, String, String, Class) */
 	public void writeField (Object object, String name) {
 		writeField(object, name, name, null);
 	}
 
-	/** @param elementType May be null if the type is unknown. */
+	/** @param elementType May be null if the type is unknown.
+	 * @see #writeField(Object, String, String, Class) */
 	public void writeField (Object object, String name, Class elementType) {
 		writeField(object, name, name, elementType);
 	}
 
+	/** @see #writeField(Object, String, String, Class) */
 	public void writeField (Object object, String fieldName, String jsonName) {
 		writeField(object, fieldName, jsonName, null);
 	}
 
-	/** @param elementType May be null if the type is unknown. */
+	/** Writes the specified field to the current JSON object.
+	 * @param elementType May be null if the type is unknown. */
 	public void writeField (Object object, String fieldName, String jsonName, Class elementType) {
 		Class type = object.getClass();
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
+		ObjectMap<String, FieldMetadata> fields = getFields(type);
 		FieldMetadata metadata = fields.get(fieldName);
 		if (metadata == null) throw new SerializationException("Field not found: " + fieldName + " (" + type.getName() + ")");
 		Field field = metadata.field;
@@ -334,7 +368,9 @@ public class Json {
 		}
 	}
 
-	/** @param value May be null. */
+	/** Writes the value as a field on the current JSON object, without writing the actual class.
+	 * @param value May be null.
+	 * @see #writeValue(String, Object, Class, Class) */
 	public void writeValue (String name, Object value) {
 		try {
 			writer.name(name);
@@ -347,8 +383,11 @@ public class Json {
 			writeValue(value, value.getClass(), null);
 	}
 
-	/** @param value May be null.
-	 * @param knownType May be null if the type is unknown. */
+	/** Writes the value as a field on the current JSON object, writing the class of the object if it differs from the specified
+	 * known type.
+	 * @param value May be null.
+	 * @param knownType May be null if the type is unknown.
+	 * @see #writeValue(String, Object, Class, Class) */
 	public void writeValue (String name, Object value, Class knownType) {
 		try {
 			writer.name(name);
@@ -358,7 +397,9 @@ public class Json {
 		writeValue(value, knownType, null);
 	}
 
-	/** @param value May be null.
+	/** Writes the value as a field on the current JSON object, writing the class of the object if it differs from the specified
+	 * known type. The specified element type is used as the default type for collections.
+	 * @param value May be null.
 	 * @param knownType May be null if the type is unknown.
 	 * @param elementType May be null if the type is unknown. */
 	public void writeValue (String name, Object value, Class knownType, Class elementType) {
@@ -370,7 +411,8 @@ public class Json {
 		writeValue(value, knownType, elementType);
 	}
 
-	/** @param value May be null. */
+	/** Writes the value, without writing the class of the object.
+	 * @param value May be null. */
 	public void writeValue (Object value) {
 		if (value == null)
 			writeValue(value, null, null);
@@ -378,13 +420,16 @@ public class Json {
 			writeValue(value, value.getClass(), null);
 	}
 
-	/** @param value May be null.
+	/** Writes the value, writing the class of the object if it differs from the specified known type.
+	 * @param value May be null.
 	 * @param knownType May be null if the type is unknown. */
 	public void writeValue (Object value, Class knownType) {
 		writeValue(value, knownType, null);
 	}
 
-	/** @param value May be null.
+	/** Writes the value, writing the class of the object if it differs from the specified known type. The specified element type is
+	 * used as the default type for collections.
+	 * @param value May be null.
 	 * @param knownType May be null if the type is unknown.
 	 * @param elementType May be null if the type is unknown. */
 	public void writeValue (Object value, Class knownType, Class elementType) {
@@ -425,6 +470,7 @@ public class Json {
 				return;
 			}
 
+			// JSON array special cases.
 			if (value instanceof Array) {
 				if (knownType != null && actualType != knownType && actualType != Array.class)
 					throw new SerializationException("Serialization of an Array other than the known type is not supported.\n"
@@ -436,18 +482,22 @@ public class Json {
 				writeArrayEnd();
 				return;
 			}
-
 			if (value instanceof Collection) {
-				if (knownType != null && actualType != knownType && actualType != ArrayList.class)
-					throw new SerializationException("Serialization of a Collection other than the known type is not supported.\n"
-						+ "Known type: " + knownType + "\nActual type: " + actualType);
-				writeArrayStart();
-				for (Object item : (Collection)value)
-					writeValue(item, elementType, null);
-				writeArrayEnd();
+				if (typeName != null && actualType != ArrayList.class && (knownType == null || knownType != actualType)) {
+					writeObjectStart(actualType, knownType);
+					writeArrayStart("items");
+					for (Object item : (Collection)value)
+						writeValue(item, elementType, null);
+					writeArrayEnd();
+					writeObjectEnd();
+				} else {
+					writeArrayStart();
+					for (Object item : (Collection)value)
+						writeValue(item, elementType, null);
+					writeArrayEnd();
+				}
 				return;
 			}
-
 			if (actualType.isArray()) {
 				if (elementType == null) elementType = actualType.getComponentType();
 				int length = ArrayReflection.getLength(value);
@@ -458,18 +508,17 @@ public class Json {
 				return;
 			}
 
-			if (value instanceof OrderedMap) {
-				if (knownType == null) knownType = OrderedMap.class;
+			// JSON object special cases.
+			if (value instanceof ObjectMap) {
+				if (knownType == null) knownType = ObjectMap.class;
 				writeObjectStart(actualType, knownType);
-				OrderedMap map = (OrderedMap)value;
-				for (Object key : map.orderedKeys()) {
-					writer.name(convertToString(key));
-					writeValue(map.get(key), elementType, null);
+				for (Entry entry : ((ObjectMap<?, ?>)value).entries()) {
+					writer.name(convertToString(entry.key));
+					writeValue(entry.value, elementType, null);
 				}
 				writeObjectEnd();
 				return;
 			}
-
 			if (value instanceof ArrayMap) {
 				if (knownType == null) knownType = ArrayMap.class;
 				writeObjectStart(actualType, knownType);
@@ -481,18 +530,6 @@ public class Json {
 				writeObjectEnd();
 				return;
 			}
-
-			if (value instanceof ObjectMap) {
-				if (knownType == null) knownType = OrderedMap.class;
-				writeObjectStart(actualType, knownType);
-				for (Entry entry : ((ObjectMap<?, ?>)value).entries()) {
-					writer.name(convertToString(entry.key));
-					writeValue(entry.value, elementType, null);
-				}
-				writeObjectEnd();
-				return;
-			}
-
 			if (value instanceof Map) {
 				if (knownType == null) knownType = HashMap.class;
 				writeObjectStart(actualType, knownType);
@@ -504,14 +541,18 @@ public class Json {
 				return;
 			}
 
+			// Enum special case.
 			if (ClassReflection.isAssignableFrom(Enum.class, actualType)) {
-				if (knownType == null || !knownType.equals(actualType)) {
+				if (typeName != null && (knownType == null || knownType != actualType)) {
+					// Ensures that enums with specific implementations (abstract logic) serialize correctly.
+					if (actualType.getEnumConstants() == null) actualType = actualType.getSuperclass();
+
 					writeObjectStart(actualType, null);
 					writer.name("value");
-					writer.value(value);
+					writer.value(convertToString((Enum)value));
 					writeObjectEnd();
 				} else {
-					writer.value(value);
+					writer.value(convertToString((Enum)value));
 				}
 				return;
 			}
@@ -551,7 +592,8 @@ public class Json {
 		}
 	}
 
-	/** @param knownType May be null if the type is unknown. */
+	/** Starts writing an object, writing the actualType to a field if needed.
+	 * @param knownType May be null if the type is unknown. */
 	public void writeObjectStart (Class actualType, Class knownType) {
 		try {
 			writer.object();
@@ -596,7 +638,7 @@ public class Json {
 
 	public void writeType (Class type) {
 		if (typeName == null) return;
-		String className = classToTag.get(type);
+		String className = getTag(type);
 		if (className == null) className = type.getName();
 		try {
 			writer.set(typeName, className);
@@ -693,33 +735,38 @@ public class Json {
 	/** @param elementType May be null if the type is unknown. */
 	public void readField (Object object, String fieldName, String jsonName, Class elementType, JsonValue jsonMap) {
 		Class type = object.getClass();
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
+		ObjectMap<String, FieldMetadata> fields = getFields(type);
 		FieldMetadata metadata = fields.get(fieldName);
 		if (metadata == null) throw new SerializationException("Field not found: " + fieldName + " (" + type.getName() + ")");
 		Field field = metadata.field;
+		if (elementType == null) elementType = metadata.elementType;
+		readField(object, field, jsonName, elementType, jsonMap);
+	}
+
+	/** @param object May be null if the field is static.
+	 * @param elementType May be null if the type is unknown. */
+	public void readField (Object object, Field field, String jsonName, Class elementType, JsonValue jsonMap) {
 		JsonValue jsonValue = jsonMap.get(jsonName);
 		if (jsonValue == null) return;
-		if (elementType == null) elementType = metadata.elementType;
 		try {
 			field.set(object, readValue(field.getType(), elementType, jsonValue));
 		} catch (ReflectionException ex) {
-			throw new SerializationException("Error accessing field: " + field.getName() + " (" + type.getName() + ")", ex);
+			throw new SerializationException("Error accessing field: " + field.getName() + " ("
+				+ field.getDeclaringClass().getName() + ")", ex);
 		} catch (SerializationException ex) {
-			ex.addTrace(field.getName() + " (" + type.getName() + ")");
+			ex.addTrace(field.getName() + " (" + field.getDeclaringClass().getName() + ")");
 			throw ex;
 		} catch (RuntimeException runtimeEx) {
 			SerializationException ex = new SerializationException(runtimeEx);
-			ex.addTrace(field.getName() + " (" + type.getName() + ")");
+			ex.addTrace(field.getName() + " (" + field.getDeclaringClass().getName() + ")");
 			throw ex;
 		}
 	}
 
 	public void readFields (Object object, JsonValue jsonMap) {
 		Class type = object.getClass();
-		ObjectMap<String, FieldMetadata> fields = typeToFields.get(type);
-		if (fields == null) fields = cacheFields(type);
-		for (JsonValue child = jsonMap.child(); child != null; child = child.next()) {
+		ObjectMap<String, FieldMetadata> fields = getFields(type);
+		for (JsonValue child = jsonMap.child; child != null; child = child.next) {
 			FieldMetadata metadata = fields.get(child.name());
 			if (metadata == null) {
 				if (ignoreUnknownFields) {
@@ -729,7 +776,6 @@ public class Json {
 					throw new SerializationException("Field not found: " + child.name() + " (" + type.getName() + ")");
 			}
 			Field field = metadata.field;
-			// if (entry.value == null) continue; // I don't remember what this did. :(
 			try {
 				field.set(object, readValue(field.getType(), metadata.elementType, child));
 			} catch (ReflectionException ex) {
@@ -798,49 +844,64 @@ public class Json {
 			String className = typeName == null ? null : jsonData.getString(typeName, null);
 			if (className != null) {
 				jsonData.remove(typeName);
-				try {
-					type = (Class<T>)ClassReflection.forName(className);
-				} catch (ReflectionException ex) {
-					type = tagToClass.get(className);
-					if (type == null) throw new SerializationException(ex);
+				type = getClass(className);
+				if (type == null) {
+					try {
+						type = (Class<T>)ClassReflection.forName(className);
+					} catch (ReflectionException ex) {
+						throw new SerializationException(ex);
+					}
 				}
 			}
 
-			Object object;
-			if (type != null) {
-				if (type == String.class || type == Integer.class || type == Boolean.class || type == Float.class
-					|| type == Long.class || type == Double.class || type == Short.class || type == Byte.class
-					|| type == Character.class || type.isEnum()) {
-					return readValue("value", type, jsonData);
-				}
+			if (type == null) {
+				if (defaultSerializer != null) return (T)defaultSerializer.read(this, jsonData, type);
+				return (T)jsonData;
+			}
 
+			if (type == String.class || type == Integer.class || type == Boolean.class || type == Float.class || type == Long.class
+				|| type == Double.class || type == Short.class || type == Byte.class || type == Character.class
+				|| ClassReflection.isAssignableFrom(Enum.class, type)) {
+				return readValue("value", type, jsonData);
+			}
+
+			if (typeName != null && ClassReflection.isAssignableFrom(Collection.class, type)) {
+				// JSON object wrapper to specify type.
+				jsonData = jsonData.get("items");
+			} else {
 				Serializer serializer = classToSerializer.get(type);
 				if (serializer != null) return (T)serializer.read(this, jsonData, type);
 
-				object = newInstance(type);
+				Object object = newInstance(type);
 
 				if (object instanceof Serializable) {
 					((Serializable)object).read(this, jsonData);
 					return (T)object;
 				}
 
-				if (object instanceof HashMap) {
-					HashMap result = (HashMap)object;
-					for (JsonValue child = jsonData.child(); child != null; child = child.next())
+				// JSON object special cases.
+				if (object instanceof ObjectMap) {
+					ObjectMap result = (ObjectMap)object;
+					for (JsonValue child = jsonData.child; child != null; child = child.next)
 						result.put(child.name(), readValue(elementType, null, child));
 					return (T)result;
 				}
-			} else
-				return (T)jsonData;
+				if (object instanceof ArrayMap) {
+					ArrayMap result = (ArrayMap)object;
+					for (JsonValue child = jsonData.child; child != null; child = child.next)
+						result.put(child.name(), readValue(elementType, null, child));
+					return (T)result;
+				}
+				if (object instanceof Map) {
+					Map result = (Map)object;
+					for (JsonValue child = jsonData.child; child != null; child = child.next)
+						result.put(child.name(), readValue(elementType, null, child));
+					return (T)result;
+				}
 
-			if (object instanceof ObjectMap) {
-				ObjectMap result = (ObjectMap)object;
-				for (JsonValue child = jsonData.child(); child != null; child = child.next())
-					result.put(child.name(), readValue(elementType, null, child));
-				return (T)result;
+				readFields(object, jsonData);
+				return (T)object;
 			}
-			readFields(object, jsonData);
-			return (T)object;
 		}
 
 		if (type != null) {
@@ -849,26 +910,28 @@ public class Json {
 		}
 
 		if (jsonData.isArray()) {
-			if ((type == null || type == Object.class) || ClassReflection.isAssignableFrom(Array.class, type)) {
-				Array newArray = (type == null || type == Object.class) ? new Array() : (Array)newInstance(type);
-				for (JsonValue child = jsonData.child(); child != null; child = child.next())
-					newArray.add(readValue(elementType, null, child));
-				return (T)newArray;
+			// JSON array special cases.
+			if (type == null || type == Object.class) type = (Class<T>)Array.class;
+			if (ClassReflection.isAssignableFrom(Array.class, type)) {
+				Array result = type == Array.class ? new Array() : (Array)newInstance(type);
+				for (JsonValue child = jsonData.child; child != null; child = child.next)
+					result.add(readValue(elementType, null, child));
+				return (T)result;
 			}
-			if (ClassReflection.isAssignableFrom(List.class, type)) {
-				List newArray = type == null ? new ArrayList() : (List)newInstance(type);
-				for (JsonValue child = jsonData.child(); child != null; child = child.next())
-					newArray.add(readValue(elementType, null, child));
-				return (T)newArray;
+			if (ClassReflection.isAssignableFrom(Collection.class, type)) {
+				Collection result = type.isInterface() ? new ArrayList() : (Collection)newInstance(type);
+				for (JsonValue child = jsonData.child; child != null; child = child.next)
+					result.add(readValue(elementType, null, child));
+				return (T)result;
 			}
 			if (type.isArray()) {
 				Class componentType = type.getComponentType();
 				if (elementType == null) elementType = componentType;
-				Object newArray = ArrayReflection.newInstance(componentType, jsonData.size());
+				Object result = ArrayReflection.newInstance(componentType, jsonData.size);
 				int i = 0;
-				for (JsonValue child = jsonData.child(); child != null; child = child.next())
-					ArrayReflection.set(newArray, i++, readValue(elementType, null, child));
-				return (T)newArray;
+				for (JsonValue child = jsonData.child; child != null; child = child.next)
+					ArrayReflection.set(result, i++, readValue(elementType, null, child));
+				return (T)result;
 			}
 			throw new SerializationException("Unable to convert value to required type: " + jsonData + " (" + type.getName() + ")");
 		}
@@ -878,10 +941,10 @@ public class Json {
 				if (type == null || type == float.class || type == Float.class) return (T)(Float)jsonData.asFloat();
 				if (type == int.class || type == Integer.class) return (T)(Integer)jsonData.asInt();
 				if (type == long.class || type == Long.class) return (T)(Long)jsonData.asLong();
-				if (type == double.class || type == Double.class) return (T)(Double)(double)jsonData.asFloat();
-				if (type == String.class) return (T)Float.toString(jsonData.asFloat());
-				if (type == short.class || type == Short.class) return (T)(Short)(short)jsonData.asInt();
-				if (type == byte.class || type == Byte.class) return (T)(Byte)(byte)jsonData.asInt();
+				if (type == double.class || type == Double.class) return (T)(Double)jsonData.asDouble();
+				if (type == String.class) return (T)jsonData.asString();
+				if (type == short.class || type == Short.class) return (T)(Short)jsonData.asShort();
+				if (type == byte.class || type == Byte.class) return (T)(Byte)jsonData.asByte();
 			} catch (NumberFormatException ignored) {
 			}
 			jsonData = new JsonValue(jsonData.asString());
@@ -910,9 +973,11 @@ public class Json {
 			if (type == boolean.class || type == Boolean.class) return (T)Boolean.valueOf(string);
 			if (type == char.class || type == Character.class) return (T)(Character)string.charAt(0);
 			if (ClassReflection.isAssignableFrom(Enum.class, type)) {
-				Object[] constants = type.getEnumConstants();
-				for (int i = 0, n = constants.length; i < n; i++)
-					if (string.equals(constants[i].toString())) return (T)constants[i];
+				Enum[] constants = (Enum[])type.getEnumConstants();
+				for (int i = 0, n = constants.length; i < n; i++) {
+					Enum e = constants[i];
+					if (string.equals(convertToString(e))) return (T)e;
+				}
 			}
 			if (type == CharSequence.class) return (T)string;
 			throw new SerializationException("Unable to convert value to required type: " + jsonData + " (" + type.getName() + ")");
@@ -921,12 +986,17 @@ public class Json {
 		return null;
 	}
 
+	private String convertToString (Enum e) {
+		return enumNames ? e.name() : e.toString();
+	}
+
 	private String convertToString (Object object) {
+		if (object instanceof Enum) return convertToString((Enum)object);
 		if (object instanceof Class) return ((Class)object).getName();
 		return String.valueOf(object);
 	}
 
-	private Object newInstance (Class type) {
+	protected Object newInstance (Class type) {
 		try {
 			return ClassReflection.newInstance(type);
 		} catch (Exception ex) {
@@ -937,7 +1007,8 @@ public class Json {
 				return constructor.newInstance();
 			} catch (SecurityException ignored) {
 			} catch (ReflectionException ignored) {
-				if (type.isEnum()) {
+				if (ClassReflection.isAssignableFrom(Enum.class, type)) {
+					if (type.getEnumConstants() == null) type = type.getSuperclass();
 					return type.getEnumConstants()[0];
 				}
 				if (type.isArray())
@@ -969,13 +1040,23 @@ public class Json {
 		return new JsonReader().parse(json).prettyPrint(outputType, singleLineColumns);
 	}
 
+	public String prettyPrint (Object object, PrettyPrintSettings settings) {
+		return prettyPrint(toJson(object), settings);
+	}
+
+	public String prettyPrint (String json, PrettyPrintSettings settings) {
+		return new JsonReader().parse(json).prettyPrint(settings);
+	}
+
 	static private class FieldMetadata {
 		Field field;
 		Class elementType;
 
 		public FieldMetadata (Field field) {
 			this.field = field;
-			this.elementType = field.getElementType();
+			int index = (ClassReflection.isAssignableFrom(ObjectMap.class, field.getType()) || ClassReflection.isAssignableFrom(
+				Map.class, field.getType())) ? 1 : 0;
+			this.elementType = field.getElementType(index);
 		}
 	}
 

@@ -6,6 +6,7 @@ precision mediump float;
 #else
 #define MED
 #define LOWP
+#define HIGH
 #endif
 
 #if defined(specularTextureFlag) || defined(specularColorFlag)
@@ -29,7 +30,14 @@ varying float v_alphaTest;
 
 #if defined(diffuseTextureFlag) || defined(specularTextureFlag)
 #define textureFlag
-varying MED vec2 v_texCoords0;
+#endif
+
+#ifdef diffuseTextureFlag
+varying MED vec2 v_diffuseUV;
+#endif
+
+#ifdef specularTextureFlag
+varying MED vec2 v_specularUV;
 #endif
 
 #ifdef diffuseColorFlag
@@ -55,9 +63,40 @@ uniform sampler2D u_normalTexture;
 #ifdef lightingFlag
 varying vec3 v_lightDiffuse;
 
+#if	defined(ambientLightFlag) || defined(ambientCubemapFlag) || defined(sphericalHarmonicsFlag)
+#define ambientFlag
+#endif //ambientFlag
+
 #ifdef specularFlag
 varying vec3 v_lightSpecular;
 #endif //specularFlag
+
+#ifdef shadowMapFlag
+uniform sampler2D u_shadowTexture;
+uniform float u_shadowPCFOffset;
+varying vec3 v_shadowMapUv;
+#define separateAmbientFlag
+
+float getShadowness(vec2 offset)
+{
+    const vec4 bitShifts = vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 160581375.0);
+    return step(v_shadowMapUv.z, dot(texture2D(u_shadowTexture, v_shadowMapUv.xy + offset), bitShifts));//+(1.0/255.0));	
+}
+
+float getShadow() 
+{
+	return (//getShadowness(vec2(0,0)) + 
+			getShadowness(vec2(u_shadowPCFOffset, u_shadowPCFOffset)) +
+			getShadowness(vec2(-u_shadowPCFOffset, u_shadowPCFOffset)) +
+			getShadowness(vec2(u_shadowPCFOffset, -u_shadowPCFOffset)) +
+			getShadowness(vec2(-u_shadowPCFOffset, -u_shadowPCFOffset))) * 0.25;
+}
+#endif //shadowMapFlag
+
+#if defined(ambientFlag) && defined(separateAmbientFlag)
+varying vec3 v_ambientLight;
+#endif //separateAmbientFlag
+
 #endif //lightingFlag
 
 #ifdef fogFlag
@@ -71,13 +110,13 @@ void main() {
 	#endif // normalFlag
 		
 	#if defined(diffuseTextureFlag) && defined(diffuseColorFlag) && defined(colorFlag)
-		vec4 diffuse = texture2D(u_diffuseTexture, v_texCoords0) * u_diffuseColor * v_color;
+		vec4 diffuse = texture2D(u_diffuseTexture, v_diffuseUV) * u_diffuseColor * v_color;
 	#elif defined(diffuseTextureFlag) && defined(diffuseColorFlag)
-		vec4 diffuse = texture2D(u_diffuseTexture, v_texCoords0) * u_diffuseColor;
+		vec4 diffuse = texture2D(u_diffuseTexture, v_diffuseUV) * u_diffuseColor;
 	#elif defined(diffuseTextureFlag) && defined(colorFlag)
-		vec4 diffuse = texture2D(u_diffuseTexture, v_texCoords0) * v_color;
+		vec4 diffuse = texture2D(u_diffuseTexture, v_diffuseUV) * v_color;
 	#elif defined(diffuseTextureFlag)
-		vec4 diffuse = texture2D(u_diffuseTexture, v_texCoords0);
+		vec4 diffuse = texture2D(u_diffuseTexture, v_diffuseUV);
 	#elif defined(diffuseColorFlag) && defined(colorFlag)
 		vec4 diffuse = u_diffuseColor * v_color;
 	#elif defined(diffuseColorFlag)
@@ -91,24 +130,50 @@ void main() {
 	#if (!defined(lightingFlag))  
 		gl_FragColor.rgb = diffuse.rgb;
 	#elif (!defined(specularFlag))
-		gl_FragColor.rgb = (diffuse.rgb * v_lightDiffuse);
+		#if defined(ambientFlag) && defined(separateAmbientFlag)
+			#ifdef shadowMapFlag
+				gl_FragColor.rgb = (diffuse.rgb * (v_ambientLight + getShadow() * v_lightDiffuse));
+				//gl_FragColor.rgb = texture2D(u_shadowTexture, v_shadowMapUv.xy);
+			#else
+				gl_FragColor.rgb = (diffuse.rgb * (v_ambientLight + v_lightDiffuse));
+			#endif //shadowMapFlag
+		#else
+			#ifdef shadowMapFlag
+				gl_FragColor.rgb = getShadow() * (diffuse.rgb * v_lightDiffuse);
+			#else
+				gl_FragColor.rgb = (diffuse.rgb * v_lightDiffuse);
+			#endif //shadowMapFlag
+		#endif
 	#else
 		#if defined(specularTextureFlag) && defined(specularColorFlag)
-			vec3 specular = texture2D(u_specularTexture, v_texCoords0).rgb * u_specularColor.rgb * v_lightSpecular;
+			vec3 specular = texture2D(u_specularTexture, v_specularUV).rgb * u_specularColor.rgb * v_lightSpecular;
 		#elif defined(specularTextureFlag)
-			vec3 specular = texture2D(u_specularTexture, v_texCoords0).rgb * v_lightSpecular;
+			vec3 specular = texture2D(u_specularTexture, v_specularUV).rgb * v_lightSpecular;
 		#elif defined(specularColorFlag)
 			vec3 specular = u_specularColor.rgb * v_lightSpecular;
-		#else //if defined(lightingFlag)
+		#else
 			vec3 specular = v_lightSpecular;
 		#endif
 			
-		gl_FragColor.rgb = (diffuse.rgb * v_lightDiffuse) + specular;
+		#if defined(ambientFlag) && defined(separateAmbientFlag)
+			#ifdef shadowMapFlag
+			gl_FragColor.rgb = (diffuse.rgb * (getShadow() * v_lightDiffuse + v_ambientLight)) + specular;
+				//gl_FragColor.rgb = texture2D(u_shadowTexture, v_shadowMapUv.xy);
+			#else
+				gl_FragColor.rgb = (diffuse.rgb * (v_lightDiffuse + v_ambientLight)) + specular;
+			#endif //shadowMapFlag
+		#else
+			#ifdef shadowMapFlag
+				gl_FragColor.rgb = getShadow() * ((diffuse.rgb * v_lightDiffuse) + specular);
+			#else
+				gl_FragColor.rgb = (diffuse.rgb * v_lightDiffuse) + specular;
+			#endif //shadowMapFlag
+		#endif
 	#endif //lightingFlag
 
 	#ifdef fogFlag
-    	gl_FragColor.rgb = mix(gl_FragColor.rgb, u_fogColor.rgb, v_fog);
-    #endif // end fogFlag
+		gl_FragColor.rgb = mix(gl_FragColor.rgb, u_fogColor.rgb, v_fog);
+	#endif // end fogFlag
 
 	#ifdef blendedFlag
 		gl_FragColor.a = diffuse.a * v_opacity;
@@ -116,6 +181,8 @@ void main() {
 			if (gl_FragColor.a <= v_alphaTest)
 				discard;
 		#endif
+	#else
+		gl_FragColor.a = 1.0;
 	#endif
 
 }
